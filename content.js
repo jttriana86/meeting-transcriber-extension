@@ -4,9 +4,32 @@
 (function() {
   'use strict';
 
+  // ── Verificar si el contexto de la extensión sigue válido ──────────────────
+  // Cuando se recarga la extensión con Meet abierto, Chrome invalida el contexto
+  // del content script. Hay que detener el MutationObserver antes de que siga
+  // disparando errores "Extension context invalidated".
+  function isExtensionValid() {
+    try {
+      return !!chrome.runtime?.id;
+    } catch {
+      return false;
+    }
+  }
+
+  function emergencyStop() {
+    // Desconectar todos los observers activos para que dejen de disparar
+    try { MeetCaptionCapture.observer?.disconnect(); } catch {}
+    try { ZoomCaptionCapture.observer?.disconnect(); } catch {}
+    try { TeamsCaptionCapture.observer?.disconnect(); } catch {}
+    try { clearInterval(MeetCaptionCapture.pollInterval); } catch {}
+    try { clearInterval(ZoomCaptionCapture.pollInterval); } catch {}
+    try { clearInterval(TeamsCaptionCapture.pollInterval); } catch {}
+  }
+
   // State
   let isRecording = false;
   let platform = null;
+  let healthCheckTimeout = null;
 
   // ============================================
   // GOOGLE MEET CAPTION CAPTURE
@@ -19,17 +42,21 @@
     lastCaptionText: '',
     lastCaptionTime: 0,
     currentBuffer: new Map(), // speaker -> {text, timestamp, timeoutId}
+    wordCount: 0,
+    lastSpeaker: null,
 
-    // Selectores DOM para captions de Meet (actualizados marzo 2025)
+    // Selectores DOM para captions de Meet (estrategia multi-nivel)
     SELECTORS: {
-      // Contenedor principal de captions
-      captionContainer: '[data-is-muted] ~ div, [jsname="dsyhDe"], .a4cQT',
-      // Texto de caption individual
-      captionText: '[data-message-text], .CNusmb, .TBMuR span',
+      // Contenedor principal - múltiples fallbacks por orden de confiabilidad
+      captionContainer: '[jsname="dsyhDe"], [data-panel-id="10"], .a4cQT, [jsname="YPqjbf"]',
+      // Texto de caption - clases conocidas + atributos estables
+      captionText: '[data-message-text], .CNusmb, .bj4p3b, .TBMuR span, [class*="caption"], [class*="subtitle"]',
       // Nombre del speaker
-      speakerName: '[data-sender-name], .zs7s8d, .NWpY1d',
-      // Contenedor de captions activo (indica que CC está ON)
-      captionsActive: '[jsname="Ypp7Cf"], .iOzk7, [data-panel-id="10"]'
+      speakerName: '[data-sender-name], .zs7s8d, .NWpY1d, [class*="speaker-name"], [class*="sender-name"]',
+      // Región aria-live (muy estable entre versiones de Meet)
+      ariaLiveRegion: '[aria-live="polite"], [aria-live="assertive"]',
+      // Contenedor de captions activo
+      captionsActive: '[jsname="Ypp7Cf"], .iOzk7, [data-panel-id="10"], [aria-label*="caption" i], [aria-label*="subtítulo" i]'
     },
 
     // Iniciar captura
@@ -39,6 +66,8 @@
       this.transcript = [];
       this.lastCaptionText = '';
       this.currentBuffer.clear();
+      this.wordCount = 0;
+      this.lastSpeaker = null;
 
       // Cargar transcripción existente de esta sesión
       this.loadExistingTranscript();
@@ -72,15 +101,32 @@
 
     // Encontrar el contenedor de captions
     findCaptionContainer() {
-      // Estrategia 1: Buscar por selectores conocidos
-      for (const selector of Object.values(this.SELECTORS)) {
-        const element = document.querySelector(selector);
-        if (element && this.looksLikeCaptionContainer(element)) {
-          return element;
+      // Estrategia 1: Buscar por selectores de atributos estables
+      for (const selector of [this.SELECTORS.captionContainer, this.SELECTORS.captionsActive]) {
+        try {
+          const element = document.querySelector(selector);
+          if (element && this.looksLikeCaptionContainer(element)) {
+            return element;
+          }
+        } catch (e) { /* selector inválido, ignorar */ }
+      }
+
+      // Estrategia 2: Regiones aria-live en la mitad inferior (muy fiable)
+      const liveRegions = document.querySelectorAll(this.SELECTORS.ariaLiveRegion);
+      for (const region of liveRegions) {
+        const rect = region.getBoundingClientRect();
+        // Captions suelen aparecer en el 40% inferior de la pantalla
+        if (rect.top > window.innerHeight * 0.35 && rect.width > 100) {
+          console.log('[Meet Capture] Found aria-live caption region');
+          return region;
         }
       }
 
-      // Estrategia 2: Buscar divs con texto que parezcan captions
+      // Estrategia 3: Buscar por aria-label que mencione captions/subtítulos
+      const captionByLabel = document.querySelector('[aria-label*="caption" i], [aria-label*="subtitle" i], [aria-label*="subtítulo" i]');
+      if (captionByLabel) return captionByLabel;
+
+      // Estrategia 4: Buscar divs con texto que parezcan captions
       const allDivs = document.querySelectorAll('div[jsname], div[data-message-text]');
       for (const div of allDivs) {
         if (this.looksLikeCaptionContainer(div)) {
@@ -95,9 +141,18 @@
     looksLikeCaptionContainer(element) {
       if (!element) return false;
 
-      // Verificar si tiene texto y está en la parte inferior de la pantalla
+      // aria-live es una señal muy fuerte de contenedor de captions
+      if (element.hasAttribute('aria-live')) return true;
+
+      // aria-label que mencione captions
+      const ariaLabel = element.getAttribute('aria-label')?.toLowerCase() || '';
+      if (ariaLabel.includes('caption') || ariaLabel.includes('subtitle') || ariaLabel.includes('subtítulo')) {
+        return true;
+      }
+
+      // Fallback: elemento en la parte inferior con texto
       const rect = element.getBoundingClientRect();
-      const isLowerHalf = rect.top > window.innerHeight / 2;
+      const isLowerHalf = rect.top > window.innerHeight * 0.35;
       const hasText = element.textContent?.trim().length > 0;
 
       return isLowerHalf && hasText;
@@ -108,6 +163,8 @@
       if (this.observer) {
         this.observer.disconnect();
       }
+
+      this.captionContainer = container; // referencia para leer texto visible al hacer stop
 
       this.observer = new MutationObserver((mutations) => {
         this.processMutations(mutations);
@@ -134,11 +191,21 @@
       if (this.observer) return;
 
       this.observer = new MutationObserver((mutations) => {
-        // Buscar si alguna mutación contiene captions
+        // Buscar si alguna mutación introduce el contenedor de captions
         for (const mutation of mutations) {
           if (mutation.addedNodes.length > 0) {
             for (const node of mutation.addedNodes) {
               if (node.nodeType === Node.ELEMENT_NODE) {
+                // Verificar si el nodo añadido es un aria-live (captions de Meet)
+                if (node.getAttribute?.('aria-live')) {
+                  const rect = node.getBoundingClientRect();
+                  if (rect.top > window.innerHeight * 0.35) {
+                    this.observer.disconnect();
+                    this.observer = null;
+                    this.setupObserver(node);
+                    return;
+                  }
+                }
                 const captionContainer = this.findCaptionContainer();
                 if (captionContainer) {
                   this.observer.disconnect();
@@ -166,17 +233,27 @@
 
     // Procesar mutaciones del DOM
     processMutations(mutations) {
+      if (!isExtensionValid()) { emergencyStop(); return; }
+
       for (const mutation of mutations) {
-        // Cambios de texto
+        // Cambios de texto en vivo — rastrear el estado más reciente en liveNodes
         if (mutation.type === 'characterData') {
           const text = mutation.target.textContent?.trim();
           if (text && text !== mutation.oldValue?.trim()) {
+            // Guardar en liveNodes para capturarlo cuando sea eliminado
+            this.trackLiveNode(mutation.target, text);
             this.handleCaptionUpdate(text, this.extractSpeaker(mutation.target));
           }
         }
 
-        // Nodos añadidos
-        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+        if (mutation.type === 'childList') {
+          // NODOS ELIMINADOS: este es el momento dorado — Meet terminó de corregir la frase
+          // El texto en removedNodes es el texto FINAL después de todas las correcciones de STT
+          for (const node of mutation.removedNodes) {
+            this.captureRemovedNode(node);
+          }
+
+          // Nodos añadidos
           for (const node of mutation.addedNodes) {
             this.extractCaptionsFromNode(node);
           }
@@ -184,11 +261,88 @@
       }
     },
 
+    // Mapa de nodos vivos → texto más reciente
+    liveNodes: new WeakMap(),
+
+    trackLiveNode(node, text) {
+      this.liveNodes.set(node, { text, speaker: this.extractSpeaker(node) });
+    },
+
+    // Capturar texto final cuando Meet elimina un nodo de caption.
+    // SOLO procesamos nodos que pasaron por trackLiveNode (tuvieron mutaciones characterData).
+    // Esto evita capturar texto estático del DOM (menús, configuración, idiomas, etc.)
+    // que nunca fue speech en vivo.
+    captureRemovedNode(node) {
+      // Nodo directo: solo si fue trackeado como speech en vivo
+      const tracked = this.liveNodes.get(node);
+      if (tracked?.text) {
+        this.commitFinalText(tracked.text, tracked.speaker);
+      }
+
+      // Revisar hijos también (el nodo eliminado puede ser un contenedor)
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const children = node.querySelectorAll ? node.querySelectorAll('*') : [];
+        for (const child of children) {
+          const childTracked = this.liveNodes.get(child);
+          if (childTracked?.text) {
+            this.commitFinalText(childTracked.text, childTracked.speaker);
+          }
+        }
+      }
+    },
+
+    // Guardar texto final al transcript directamente (sin buffer)
+    commitFinalText(text, speaker) {
+      if (!text || text.length < 3) return;
+      const textLow = text.toLowerCase().trim();
+
+      // Verificar duplicado contra las últimas entradas
+      const lookback = Math.min(this.transcript.length, 30);
+      for (let i = this.transcript.length - 1; i >= this.transcript.length - lookback; i--) {
+        const existingLow = this.transcript[i].text.toLowerCase().trim();
+        if (existingLow === textLow) return;
+        if (existingLow.includes(textLow)) return;
+      }
+
+      // Si extiende la última entrada del mismo speaker, reemplazar
+      const last = this.transcript[this.transcript.length - 1];
+      if (last && last.speaker === (speaker || 'Unknown') && text.length > last.text.length) {
+        const lastWords = last.text.toLowerCase().slice(-15).trim();
+        if (lastWords.length >= 5 && textLow.includes(lastWords)) {
+          const prevWords = last.text.trim().split(/\s+/).length;
+          const newWords = text.trim().split(/\s+/).length;
+          this.transcript[this.transcript.length - 1] = {
+            timestamp: last.timestamp,
+            speaker: speaker || last.speaker,
+            text,
+            isoTime: new Date(last.timestamp).toISOString()
+          };
+          this.wordCount += Math.max(0, newWords - prevWords);
+          this.lastSpeaker = speaker || last.speaker;
+          this.saveTranscript();
+          console.log(`[Meet] Final (extended): "${text}"`);
+          return;
+        }
+      }
+
+      const entry = {
+        timestamp: Date.now(),
+        speaker: speaker || 'Unknown',
+        text,
+        isoTime: new Date().toISOString()
+      };
+      this.transcript.push(entry);
+      this.wordCount += text.trim().split(/\s+/).filter(w => w).length;
+      this.lastSpeaker = speaker || 'Unknown';
+      console.log(`[Meet] Final: "${speaker}": "${text}"`);
+      this.saveTranscript();
+    },
+
     // Extraer captions de un nodo
     extractCaptionsFromNode(node) {
       if (node.nodeType === Node.TEXT_NODE) {
         const text = node.textContent?.trim();
-        if (text && text.length > 0) {
+        if (text && text.length > 1) {
           this.handleCaptionUpdate(text, this.extractSpeaker(node));
         }
         return;
@@ -196,21 +350,49 @@
 
       if (node.nodeType !== Node.ELEMENT_NODE) return;
 
-      // Buscar texto de caption
+      // Intento 1: selectores específicos conocidos
       const captionElements = node.querySelectorAll
         ? node.querySelectorAll(this.SELECTORS.captionText)
         : [];
 
-      for (const elem of captionElements) {
-        const text = elem.textContent?.trim();
-        if (text) {
-          this.handleCaptionUpdate(text, this.extractSpeaker(elem));
+      if (captionElements.length > 0) {
+        for (const elem of captionElements) {
+          const text = elem.textContent?.trim();
+          if (text) {
+            this.handleCaptionUpdate(text, this.extractSpeaker(elem));
+          }
         }
+        return;
       }
 
-      // También verificar el texto directo del nodo
-      if (node.textContent?.trim() && !node.querySelector) {
-        this.handleCaptionUpdate(node.textContent.trim(), 'Unknown');
+      // Intento 2: fallback agresivo - cualquier texto del nodo que tenga sentido
+      // (evitar menús, botones, y textos muy largos)
+      const tag = node.tagName?.toLowerCase();
+      if (['button', 'input', 'select', 'svg', 'path', 'img'].includes(tag)) return;
+
+      const speaker = this.extractSpeaker(node);
+
+      // Construir texto excluyendo el elemento del speaker para evitar "NombreTexto"
+      let allText = '';
+      for (const child of node.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          allText += child.textContent;
+        } else if (child.nodeType === Node.ELEMENT_NODE) {
+          // Excluir si el hijo es el elemento del speaker
+          const childText = child.textContent?.trim();
+          if (speaker !== 'Unknown' && childText === speaker) continue;
+          allText += child.textContent;
+        }
+      }
+      allText = allText.trim();
+
+      // Si el texto empieza con el nombre del speaker (concatenación), quitarlo
+      if (speaker !== 'Unknown' && allText.startsWith(speaker)) {
+        allText = allText.substring(speaker.length).trim();
+      }
+
+      if (allText && allText.length > 1 && allText.length < 600) {
+        this.handleCaptionUpdate(allText, speaker);
       }
     },
 
@@ -218,24 +400,40 @@
     extractSpeaker(node) {
       if (!node) return 'Unknown';
 
-      // Subir en el árbol DOM buscando el nombre
-      let current = node.parentElement;
-      let maxDepth = 10;
+      let current = node.nodeType === Node.TEXT_NODE ? node.parentElement : node;
+      let maxDepth = 12;
 
       while (current && maxDepth > 0) {
-        // Buscar elemento con nombre de speaker
-        const speakerElem = current.querySelector(this.SELECTORS.speakerName);
+        // 1. Atributo data-sender-name (estable entre versiones de Meet)
+        const senderName = current.getAttribute?.('data-sender-name');
+        if (senderName?.trim()) return senderName.trim();
+
+        // 2. Selectores conocidos de speaker
+        const speakerElem = current.querySelector?.(this.SELECTORS.speakerName);
         if (speakerElem) {
           const name = speakerElem.textContent?.trim();
-          if (name && name.length < 100) { // Sanity check
-            return name;
+          if (name && name.length > 0 && name.length < 80) return name;
+        }
+
+        // 3. Buscar el primer hijo de texto corto del contenedor padre
+        //    Meet suele poner: <div>[Nombre]</div><div>[Texto caption]</div>
+        if (current.children?.length >= 2) {
+          const firstChild = current.children[0];
+          const text = firstChild.textContent?.trim();
+          // Un nombre suele ser corto (2-50 chars) y no contener signos de puntuación del speech
+          if (text && text.length >= 2 && text.length <= 50 && !/[.!?,]$/.test(text)) {
+            // Verificar que el nodo actual contiene el nodo fuente
+            if (current.contains(node instanceof Node ? node : null) ||
+                current.contains(node?.parentElement)) {
+              return text;
+            }
           }
         }
 
-        // Verificar atributos data-sender-name
-        const senderName = current.getAttribute?.('data-sender-name');
-        if (senderName) {
-          return senderName;
+        // 4. aria-label del contenedor puede incluir el nombre
+        const ariaLabel = current.getAttribute?.('aria-label');
+        if (ariaLabel && ariaLabel.length < 80 && !ariaLabel.toLowerCase().includes('caption')) {
+          return ariaLabel.trim();
         }
 
         current = current.parentElement;
@@ -251,67 +449,103 @@
 
       const now = Date.now();
 
-      // Google Meet actualiza el texto mientras se habla
-      // Debounce: esperar a que el texto se estabilice
-      const bufferKey = speaker || 'default';
-      const existing = this.currentBuffer.get(bufferKey);
-
-      // Limpiar timeout anterior si existe
-      if (existing?.timeoutId) {
-        clearTimeout(existing.timeoutId);
-      }
-
-      // Verificar si es texto nuevo o actualización
-      if (existing && this.isTextUpdate(existing.text, text)) {
-        // Es una actualización del mismo caption, actualizar buffer
-        this.currentBuffer.set(bufferKey, {
-          text: text,
-          timestamp: existing.timestamp, // Mantener timestamp original
-          timeoutId: setTimeout(() => this.flushBuffer(bufferKey), 1500)
-        });
-      } else if (!existing || !this.isDuplicate(existing.text, text)) {
-        // Es texto nuevo
-        // Flush el buffer anterior primero si existe
-        if (existing) {
-          this.flushBuffer(bufferKey);
+      // --- Paso 1: buscar si CUALQUIER entrada del buffer es una actualización de este texto ---
+      // Meet actualiza el caption en vivo; el speaker puede alternar entre Unknown y el nombre real,
+      // así que buscamos en todos los buffers, no solo en el del mismo speaker.
+      let matchKey = null;
+      let matchEntry = null;
+      for (const [key, entry] of this.currentBuffer) {
+        if (this.isTextUpdate(entry.text, text)) {
+          matchKey = key;
+          matchEntry = entry;
+          break;
         }
-
-        this.currentBuffer.set(bufferKey, {
-          text: text,
-          timestamp: now,
-          speaker: speaker,
-          timeoutId: setTimeout(() => this.flushBuffer(bufferKey), 1500)
-        });
       }
+
+      if (matchKey && matchEntry) {
+        // Es una actualización de un caption ya en buffer
+        clearTimeout(matchEntry.timeoutId);
+        // Preferir el speaker real sobre Unknown
+        const resolvedSpeaker = (speaker && speaker !== 'Unknown')
+          ? speaker
+          : (matchEntry.speaker && matchEntry.speaker !== 'Unknown' ? matchEntry.speaker : speaker);
+
+        // Si el speaker cambió, mover la entrada a la nueva key
+        const newKey = resolvedSpeaker || matchKey;
+        if (newKey !== matchKey) {
+          this.currentBuffer.delete(matchKey);
+        }
+        this.currentBuffer.set(newKey, {
+          text: text,
+          timestamp: matchEntry.timestamp,
+          speaker: resolvedSpeaker,
+          timeoutId: setTimeout(() => this.flushBuffer(newKey), 2000)
+        });
+        return;
+      }
+
+      // --- Paso 2: verificar contra las últimas 60 entradas del transcript ---
+      // IMPORTANTE: solo saltamos si el transcript YA CONTIENE este texto (entrada más larga existente).
+      // NO saltamos si el nuevo texto extiende una entrada previa — eso es contenido nuevo que hay que guardar.
+      // Esto corrige el caso: buffer flush "Hola hola, cómo están" → Meet sigue → "Hola hola, cómo están que vamos a hacer..."
+      // El texto extendido NO es duplicado, es la continuación.
+      const lookback = Math.min(this.transcript.length, 60);
+      const textLow = text.toLowerCase().trim();
+      for (let i = this.transcript.length - 1; i >= this.transcript.length - lookback; i--) {
+        const existingLow = this.transcript[i].text.toLowerCase().trim();
+        if (existingLow === textLow) return;         // idéntico → saltar
+        if (existingLow.includes(textLow)) return;  // ya capturado dentro de una entrada más larga → saltar
+        // NO usar similitud aquí: dos fragmentos consecutivos de la misma oración
+        // tendrán similitud alta aunque sean contenido diferente.
+      }
+
+      // --- Paso 3: texto nuevo — crear entrada en buffer ---
+      // 4000ms da más tiempo a Meet para terminar de corregir su reconocimiento de voz
+      // antes de hacer flush. Cuanto más alto, más completas las frases; cuanto más bajo,
+      // más rápido aparece en el transcript pero con más snapshots intermedios.
+      const bufferKey = (speaker && speaker !== 'Unknown') ? speaker : ('unknown_' + now);
+      this.currentBuffer.set(bufferKey, {
+        text: text,
+        timestamp: now,
+        speaker: speaker,
+        timeoutId: setTimeout(() => this.flushBuffer(bufferKey), 4000)
+      });
     },
 
-    // Verificar si es una actualización del mismo texto
+    // Verificar si el nuevo texto es una actualización/extensión del texto en buffer.
+    // IMPORTANTE: solo actualizar cuando el nuevo texto es IGUAL o MÁS LARGO.
+    // Si el nuevo texto es más corto que el del buffer, NO es una actualización —
+    // puede ser un parpadeo de Meet, no queremos perder el texto ya acumulado.
     isTextUpdate(oldText, newText) {
       if (!oldText || !newText) return false;
 
-      // El nuevo texto contiene el viejo (Meet añade palabras)
-      if (newText.startsWith(oldText) || newText.includes(oldText)) {
-        return true;
-      }
+      const old = oldText.toLowerCase().trim();
+      const nw  = newText.toLowerCase().trim();
 
-      // El viejo texto es prefijo del nuevo
-      if (oldText.length < newText.length && newText.startsWith(oldText.slice(0, -3))) {
-        return true;
-      }
+      // El nuevo texto extiende el viejo (es igual o más largo y lo contiene)
+      if (nw.length >= old.length && (nw.startsWith(old) || nw.includes(old))) return true;
+
+      // El nuevo texto es prefijo aproximado extendido del viejo (tolerancia 3 chars, solo si crece)
+      if (nw.length >= old.length && nw.startsWith(old.slice(0, -3))) return true;
 
       return false;
     },
 
-    // Verificar duplicados
+    // Verificar duplicados (case-insensitive + similitud)
     isDuplicate(existingText, newText) {
       if (!existingText || !newText) return false;
 
-      // Exactamente igual
-      if (existingText === newText) return true;
+      const a = existingText.toLowerCase().trim();
+      const b = newText.toLowerCase().trim();
 
-      // Diferencia menor (errores de corrección de Meet)
-      const similarity = this.calculateSimilarity(existingText, newText);
-      return similarity > 0.85;
+      if (a === b) return true;
+
+      // Solo es duplicado si el EXISTENTE ya contiene el texto nuevo.
+      // NO al revés: si el nuevo contiene al existente, es una extensión (más contenido),
+      // no un duplicado — eso lo maneja el extend-replace en flushBuffer.
+      if (a.includes(b)) return true;
+
+      return false;
     },
 
     // Calcular similitud entre dos strings (Sørensen-Dice)
@@ -339,12 +573,7 @@
       const entry = this.currentBuffer.get(bufferKey);
       if (!entry || !entry.text) return;
 
-      // Verificar que no sea duplicado de la última entrada
       const lastEntry = this.transcript[this.transcript.length - 1];
-      if (lastEntry && this.isDuplicate(lastEntry.text, entry.text)) {
-        this.currentBuffer.delete(bufferKey);
-        return;
-      }
 
       const transcriptEntry = {
         timestamp: entry.timestamp,
@@ -353,20 +582,49 @@
         isoTime: new Date(entry.timestamp).toISOString()
       };
 
+      // PRIMERO: si la nueva entrada extiende la última del mismo speaker, reemplazarla.
+      // Debe ir ANTES del chequeo isDuplicate porque isDuplicate(a, b) devuelve true
+      // cuando b contiene a — lo que ocurre exactamente cuando b extiende a.
+      if (
+        lastEntry &&
+        lastEntry.speaker === transcriptEntry.speaker &&
+        transcriptEntry.text.length > lastEntry.text.length
+      ) {
+        const lastWords = lastEntry.text.toLowerCase().slice(-15).trim();
+        if (lastWords.length >= 8 && transcriptEntry.text.toLowerCase().includes(lastWords)) {
+          this.transcript[this.transcript.length - 1] = transcriptEntry;
+          this.currentBuffer.delete(bufferKey);
+          const prevWords = lastEntry.text.trim().split(/\s+/).length;
+          const newWords = transcriptEntry.text.trim().split(/\s+/).length;
+          this.wordCount += Math.max(0, newWords - prevWords);
+          this.lastSpeaker = transcriptEntry.speaker;
+          console.log(`[Meet Capture] Extended: "${transcriptEntry.speaker}": "${transcriptEntry.text}"`);
+          this.saveTranscript();
+          return;
+        }
+      }
+
+      // SEGUNDO: descartar si es duplicado real (mismo texto o ya contenido en la última entrada)
+      if (lastEntry && this.isDuplicate(lastEntry.text, entry.text)) {
+        this.currentBuffer.delete(bufferKey);
+        return;
+      }
+
       this.transcript.push(transcriptEntry);
       this.currentBuffer.delete(bufferKey);
 
+      this.wordCount += entry.text.trim().split(/\s+/).filter(w => w).length;
+      this.lastSpeaker = entry.speaker || 'Unknown';
+
       console.log(`[Meet Capture] "${entry.speaker}": "${entry.text}"`);
 
-      // Guardar en storage
       this.saveTranscript();
-
-      // Notificar al background script
       sendTranscriptionData(entry.text, entry.speaker);
     },
 
     // Guardar transcripción en storage
     async saveTranscript() {
+      if (!isExtensionValid()) { emergencyStop(); return; }
       try {
         const meetingId = this.getMeetingId();
         const storageKey = `transcript_${meetingId}`;
@@ -377,7 +635,11 @@
           lastUpdated: Date.now()
         });
       } catch (error) {
-        console.error('[Meet Capture] Error saving transcript:', error);
+        if (error.message?.includes('Extension context invalidated')) {
+          emergencyStop();
+        } else {
+          console.error('[Meet Capture] Error saving transcript:', error);
+        }
       }
     },
 
@@ -579,6 +841,15 @@
         }
         break;
 
+      case 'GET_STATS':
+        sendResponse({
+          isRecording,
+          wordCount: capture ? capture.wordCount : 0,
+          entryCount: capture ? capture.transcript.length : 0,
+          lastSpeaker: capture ? capture.lastSpeaker : null
+        });
+        break;
+
       default:
         sendResponse({ success: false, error: 'Unknown action' });
     }
@@ -623,6 +894,18 @@
         initTeamsCapture();
         break;
     }
+
+    // Verificar salud después de 20 segundos
+    if (healthCheckTimeout) clearTimeout(healthCheckTimeout);
+    healthCheckTimeout = setTimeout(() => {
+      const capture = getActiveCapture();
+      if (isRecording && capture && capture.wordCount === 0) {
+        chrome.runtime.sendMessage({
+          action: 'CAPTION_WARNING',
+          message: 'No se detectan subtítulos. Activa los subtítulos (CC) en la reunión.'
+        }).catch(() => {});
+      }
+    }, 20000);
   }
 
   // Stop transcription
@@ -635,7 +918,37 @@
     isRecording = false;
     console.log('[Meeting Transcriber] Stopping transcription...');
 
-    // Clean up observers and listeners
+    if (healthCheckTimeout) {
+      clearTimeout(healthCheckTimeout);
+      healthCheckTimeout = null;
+    }
+
+    const capture = getActiveCapture();
+
+    // 1. Capturar nodos que aún estén visibles en el DOM pero que sí fueron trackeados
+    //    como speech en vivo (characterData mutations). Esto cubre los últimos segundos
+    //    de caption que Meet no eliminó antes de que paráramos.
+    //    NO leer textContent del contenedor — eso captura menús y UI también.
+    if (capture && capture.liveNodes && capture.captionContainer) {
+      const container = capture.captionContainer;
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_ALL);
+      let node;
+      while ((node = walker.nextNode())) {
+        const tracked = capture.liveNodes.get(node);
+        if (tracked?.text) {
+          capture.commitFinalText(tracked.text, tracked.speaker);
+        }
+      }
+    }
+
+    // 2. Flush del buffer por si aún hay entradas pendientes
+    if (capture && capture.currentBuffer) {
+      for (const [key, entry] of capture.currentBuffer) {
+        clearTimeout(entry.timeoutId);
+        capture.flushBuffer(key);
+      }
+    }
+
     cleanupCapture();
   }
 
@@ -651,6 +964,8 @@
     lastCaptionTime: 0,
     currentBuffer: new Map(), // speaker -> {text, timestamp, timeoutId}
     participantMap: new Map(), // avatar/id -> name mapping
+    wordCount: 0,
+    lastSpeaker: null,
 
     // Selectores DOM para captions de Zoom Web
     SELECTORS: {
@@ -1028,6 +1343,9 @@
       this.transcript.push(transcriptEntry);
       this.currentBuffer.delete(bufferKey);
 
+      this.wordCount += entry.text.trim().split(/\s+/).filter(w => w).length;
+      this.lastSpeaker = entry.speaker || 'Unknown';
+
       console.log(`[Zoom Capture] "${entry.speaker}": "${entry.text}"`);
 
       this.saveTranscript();
@@ -1036,6 +1354,7 @@
 
     // Guardar transcripción en storage
     async saveTranscript() {
+      if (!isExtensionValid()) { emergencyStop(); return; }
       try {
         const meetingId = this.getMeetingId();
         const storageKey = `transcript_${meetingId}`;
@@ -1046,7 +1365,11 @@
           lastUpdated: Date.now()
         });
       } catch (error) {
-        console.error('[Zoom Capture] Error saving transcript:', error);
+        if (error.message?.includes('Extension context invalidated')) {
+          emergencyStop();
+        } else {
+          console.error('[Zoom Capture] Error saving transcript:', error);
+        }
       }
     },
 
@@ -1164,6 +1487,8 @@
     lastCaptionTime: 0,
     currentBuffer: new Map(),
     captionIdMap: new Map(), // Para tracking de captions ya procesados
+    wordCount: 0,
+    lastSpeaker: null,
 
     // Selectores DOM para captions de Teams Web (basados en data-tid attributes)
     SELECTORS: {
@@ -1566,6 +1891,9 @@
         this.captionIdMap.set(entry.captionId, { text: entry.text, speaker: entry.speaker });
       }
 
+      this.wordCount += entry.text.trim().split(/\s+/).filter(w => w).length;
+      this.lastSpeaker = entry.speaker || 'Unknown';
+
       console.log(`[Teams Capture] "${entry.speaker}": "${entry.text}"`);
 
       this.saveTranscript();
@@ -1574,6 +1902,7 @@
 
     // Guardar transcripción en storage
     async saveTranscript() {
+      if (!isExtensionValid()) { emergencyStop(); return; }
       try {
         const meetingId = this.getMeetingId();
         const storageKey = `transcript_${meetingId}`;
@@ -1584,7 +1913,11 @@
           lastUpdated: Date.now()
         });
       } catch (error) {
-        console.error('[Teams Capture] Error saving transcript:', error);
+        if (error.message?.includes('Extension context invalidated')) {
+          emergencyStop();
+        } else {
+          console.error('[Teams Capture] Error saving transcript:', error);
+        }
       }
     },
 
@@ -1750,12 +2083,13 @@
   // Send transcription data to background
   function sendTranscriptionData(text, speaker = 'Unknown') {
     if (!isRecording) return;
+    if (!isExtensionValid()) { emergencyStop(); return; }
 
     chrome.runtime.sendMessage({
       action: 'TRANSCRIPTION_DATA',
       data: { text, speaker }
-    }).catch(error => {
-      console.error('[Meeting Transcriber] Error sending data:', error);
+    }).catch(() => {
+      // El popup puede no estar abierto — ignorar silenciosamente
     });
   }
 

@@ -1,0 +1,5 @@
+node_modules/
+package.json
+package-lock.json
+icons/logo_b64.txt
+logo_original.png
