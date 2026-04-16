@@ -632,7 +632,8 @@
         await chrome.storage.local.set({
           [storageKey]: this.transcript,
           currentMeetingId: meetingId,
-          lastUpdated: Date.now()
+          lastUpdated: Date.now(),
+          liveStats: { wordCount: this.wordCount, lastSpeaker: this.lastSpeaker, lastUpdated: Date.now() }
         });
       } catch (error) {
         if (error.message?.includes('Extension context invalidated')) {
@@ -650,9 +651,18 @@
         const storageKey = `transcript_${meetingId}`;
 
         const result = await chrome.storage.local.get([storageKey]);
-        if (result[storageKey] && Array.isArray(result[storageKey])) {
-          this.transcript = result[storageKey];
-          console.log(`[Meet Capture] Loaded ${this.transcript.length} existing entries`);
+        const saved = result[storageKey];
+        if (saved && Array.isArray(saved) && saved.length > 0) {
+          const isToday = new Date(saved[0].timestamp).toDateString() === new Date().toDateString();
+          if (isToday) {
+            this.transcript = saved;
+            this.wordCount = this.transcript.reduce((sum, e) => sum + e.text.trim().split(/\s+/).filter(w => w).length, 0);
+            this.lastSpeaker = this.transcript[this.transcript.length - 1]?.speaker || null;
+            console.log(`[Meet Capture] Loaded ${this.transcript.length} existing entries (${this.wordCount} words)`);
+          } else {
+            console.log('[Meet Capture] Stale transcript discarded (different day)');
+            chrome.storage.local.remove(storageKey).catch(() => {});
+          }
         }
       } catch (error) {
         console.error('[Meet Capture] Error loading transcript:', error);
@@ -950,6 +960,7 @@
     }
 
     cleanupCapture();
+    chrome.storage.local.remove('liveStats').catch(() => {});
   }
 
   // ============================================
@@ -967,17 +978,24 @@
     wordCount: 0,
     lastSpeaker: null,
 
+    // IDs estables por nodo DOM (igual que Teams fix)
+    liveNodes: new WeakMap(),
+    nodeIds: new WeakMap(),
+    nodeIdSeq: 0,
+    _captionContainerFound: false,
+
     // Selectores DOM para captions de Zoom Web
+    // IMPORTANTE: captionText actualizado con clases reales del DOM inspeccionado
     SELECTORS: {
       // Contenedor principal de subtítulos (ID único de Zoom)
       captionContainer: '#live-transcription-subtitle',
       // Selectores alternativos con wildcards
       captionContainerAlt: '[class*="live-transcription-subtitle"], [class*="live-transcription"]',
-      // Item individual de caption
+      // Item individual de caption — clase real confirmada en el DOM
       captionItem: '.live-transcription-subtitle__item, [class*="subtitle__item"]',
-      // Contenedor del texto de cada caption
-      captionText: '[class*="subtitle-text"], [class*="caption-text"]',
-      // Speaker avatar/name en cada línea de caption
+      // Texto del caption — incluye la clase real .live-transcription-subtitle__item
+      captionText: '.live-transcription-subtitle__item, [class*="subtitle__item"], .lt-subtitle-wrap',
+      // Speaker avatar/name
       speakerAvatar: '[class*="subtitle-avatar"], [class*="speaker-avatar"]',
       speakerName: '[class*="subtitle-name"], [class*="speaker-name"]',
       // Panel de participantes para mapeo de nombres
@@ -985,6 +1003,13 @@
       participantItem: '.participants-item__item-layout, [class*="participant-item"]',
       participantName: '.participants-item__display-name, [class*="display-name"]',
       participantAvatar: '.participants-item__avatar, [class*="avatar"]'
+    },
+
+    getNodeId(node) {
+      if (!this.nodeIds.has(node)) {
+        this.nodeIds.set(node, `zm_${++this.nodeIdSeq}`);
+      }
+      return this.nodeIds.get(node);
     },
 
     // Iniciar captura
@@ -995,9 +1020,15 @@
       this.lastCaptionText = '';
       this.currentBuffer.clear();
       this.participantMap.clear();
+      this.nodeIdSeq = 0;
+      this._captionContainerFound = false;
 
       // Cargar transcripción existente
       this.loadExistingTranscript();
+
+      // Log de diagnóstico — muestra elementos de caption en el DOM actual
+      const captionEls = [...document.querySelectorAll('#live-transcription-subtitle, [class*="live-transcription"], [class*="subtitle__item"]')];
+      console.log('[Zoom Capture] Caption elements in DOM:', captionEls.map(e => ({id: e.id, cls: e.className.slice(0,60), text: e.textContent.trim().slice(0,40)})));
 
       // Construir mapeo de participantes
       this.buildParticipantMap();
@@ -1005,14 +1036,37 @@
       // Intentar encontrar captions inmediatamente
       this.findAndObserveCaptions();
 
-      // Polling como fallback
+      // Polling:
+      //  - Si no encontramos el contenedor, reintentar cada vez
+      //  - Siempre hacer polling de seguridad leyendo el DOM directamente
       this.pollInterval = setInterval(() => {
-        if (!this.observer) {
+        if (!this._captionContainerFound) {
           this.findAndObserveCaptions();
         }
-        // Actualizar mapeo de participantes periódicamente
+        this.pollCurrentCaptions();
         this.buildParticipantMap();
-      }, 3000);
+      }, 1000);
+    },
+
+    // Leer captions visibles directamente del DOM (fallback anti-missed-mutations)
+    pollCurrentCaptions() {
+      let captionElems;
+      try {
+        captionElems = document.querySelectorAll(this.SELECTORS.captionText);
+      } catch { return; }
+
+      for (const elem of captionElems) {
+        const rawText = elem.innerText?.trim() || elem.textContent?.trim();
+        if (!rawText || rawText.length < 2 || rawText.length > 600) continue;
+        const { speaker, text } = this.parseZoomCaption(rawText);
+        if (!text) continue;
+        const nodeId = this.getNodeId(elem);
+        const tracked = this.liveNodes.get(elem);
+        if (!tracked || tracked.text !== text) {
+          this.liveNodes.set(elem, { text, speaker });
+          this.handleCaptionUpdate(text, speaker, nodeId);
+        }
+      }
     },
 
     // Construir mapeo de avatar -> nombre de participante
@@ -1046,27 +1100,28 @@
 
     // Buscar contenedor de captions y observar
     findAndObserveCaptions() {
-      // Buscar por ID principal
+      // Buscar por ID principal (confirmado en DOM real)
       let captionContainer = document.querySelector(this.SELECTORS.captionContainer);
 
-      // Fallback a selectores alternativos
+      // Fallback: cualquier elemento con clase live-transcription que sea visible
       if (!captionContainer) {
-        captionContainer = document.querySelector(this.SELECTORS.captionContainerAlt);
-      }
-
-      // Buscar cualquier elemento con clase que contenga 'live-transcription'
-      if (!captionContainer) {
-        const allElements = document.querySelectorAll('[class*="live-transcription"]');
+        const allElements = document.querySelectorAll('[class*="live-transcription-subtitle"]');
         for (const elem of allElements) {
-          if (elem.textContent?.trim().length > 0) {
+          const rect = elem.getBoundingClientRect();
+          if (rect.width > 0 || elem.textContent?.trim().length > 0) {
             captionContainer = elem;
             break;
           }
         }
       }
 
+      // Fallback: cualquier elemento live-transcription (incluso oculto)
+      if (!captionContainer) {
+        captionContainer = document.querySelector('[class*="live-transcription"]');
+      }
+
       if (captionContainer) {
-        console.log('[Zoom Capture] Caption container found, setting up observer');
+        console.log('[Zoom Capture] Caption container found:', captionContainer.id || captionContainer.className.slice(0,60));
         this.setupObserver(captionContainer);
         return true;
       }
@@ -1082,6 +1137,8 @@
         this.observer.disconnect();
       }
 
+      this._captionContainerFound = true;
+
       this.observer = new MutationObserver((mutations) => {
         this.processMutations(mutations);
       });
@@ -1093,13 +1150,8 @@
         characterDataOldValue: true
       });
 
-      // Limpiar polling
-      if (this.pollInterval) {
-        clearInterval(this.pollInterval);
-        this.pollInterval = null;
-      }
-
-      console.log('[Zoom Capture] MutationObserver active');
+      // NO cancelar pollInterval — sigue corriendo como safety net
+      console.log('[Zoom Capture] MutationObserver active on caption container');
 
       // Procesar contenido existente
       this.processExistingContent(container);
@@ -1111,40 +1163,47 @@
 
       this.observer = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
-          if (mutation.addedNodes.length > 0) {
-            for (const node of mutation.addedNodes) {
-              if (node.nodeType === Node.ELEMENT_NODE) {
-                // Verificar si es un contenedor de captions
-                if (node.id === 'live-transcription-subtitle' ||
-                    node.className?.includes?.('live-transcription')) {
-                  this.observer.disconnect();
-                  this.observer = null;
-                  this.setupObserver(node);
-                  return;
-                }
+          if (mutation.type !== 'childList') continue;
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== Node.ELEMENT_NODE) continue;
 
-                // Buscar dentro del nodo añadido
-                const captionContainer = node.querySelector?.(this.SELECTORS.captionContainer) ||
-                                        node.querySelector?.(this.SELECTORS.captionContainerAlt);
-                if (captionContainer) {
-                  this.observer.disconnect();
-                  this.observer = null;
-                  this.setupObserver(captionContainer);
-                  return;
-                }
-              }
+            const nodeId   = node.id || '';
+            const nodeCls  = (typeof node.className === 'string') ? node.className : '';
+
+            console.log('[Zoom] Doc observer: added', node.tagName, nodeId.slice(0,40), nodeCls.slice(0,40));
+
+            // ¿Es el contenedor de captions?
+            if (nodeId === 'live-transcription-subtitle' || nodeCls.includes('live-transcription')) {
+              console.log('[Zoom Capture] Caption container found via document observer (direct)');
+              this.observer.disconnect();
+              this.observer = null;
+              this.setupObserver(node);
+              return;
             }
+
+            // ¿Está el contenedor dentro del nodo añadido?
+            const captionContainer = node.querySelector?.('#live-transcription-subtitle') ||
+                                    node.querySelector?.('[class*="live-transcription-subtitle"]');
+            if (captionContainer) {
+              console.log('[Zoom Capture] Caption container found via document observer (nested)');
+              this.observer.disconnect();
+              this.observer = null;
+              this.setupObserver(captionContainer);
+              return;
+            }
+
+            // Aunque no encontremos el contenedor principal, intentar extraer
+            // texto de caption directamente (captura cualquier subtitle__item añadido)
+            this.extractCaptionsFromNode(node);
           }
         }
-
-        // Procesar cambios de texto en captions existentes
-        this.processMutations(mutations);
       });
 
-      this.observer.observe(document.body, {
+      // Observar document.documentElement (no solo body) para cubrir portales de React
+      const root = document.documentElement || document.body;
+      this.observer.observe(root, {
         childList: true,
-        subtree: true,
-        characterData: true
+        subtree: true
       });
 
       console.log('[Zoom Capture] Document observer active (waiting for captions)');
@@ -1152,26 +1211,48 @@
 
     // Procesar contenido existente del contenedor
     processExistingContent(container) {
-      const text = container.innerText?.trim();
-      if (text) {
-        this.handleCaptionUpdate(text, this.extractSpeakerFromContainer(container));
+      // Intentar leer items individuales primero
+      const items = container.querySelectorAll?.(this.SELECTORS.captionItem);
+      if (items && items.length > 0) {
+        for (const item of items) {
+          const text = item.textContent?.trim();
+          if (text && text.length > 1) {
+            const nodeId = this.getNodeId(item);
+            const speaker = this.extractSpeakerFromNode(item);
+            this.liveNodes.set(item, { text, speaker });
+            this.handleCaptionUpdate(text, speaker, nodeId);
+          }
+        }
+        return;
+      }
+      // Fallback: texto completo del contenedor
+      const text = container.innerText?.trim() || container.textContent?.trim();
+      if (text && text.length > 1) {
+        const nodeId = this.getNodeId(container);
+        this.handleCaptionUpdate(text, this.extractSpeakerFromContainer(container), nodeId);
       }
     },
 
-    // Procesar mutaciones del DOM
+    // Procesar mutaciones del DOM (con IDs estables por nodo)
     processMutations(mutations) {
       for (const mutation of mutations) {
-        // Cambios de texto
+        // Cambios de texto en vivo
         if (mutation.type === 'characterData') {
           const text = mutation.target.textContent?.trim();
           if (text && text !== mutation.oldValue?.trim()) {
             const speaker = this.extractSpeakerFromNode(mutation.target);
-            this.handleCaptionUpdate(text, speaker);
+            const nodeId = this.getNodeId(mutation.target);
+            this.liveNodes.set(mutation.target, { text, speaker });
+            this.handleCaptionUpdate(text, speaker, nodeId);
           }
         }
 
-        // Nodos añadidos
-        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+        if (mutation.type === 'childList') {
+          // Nodos eliminados → flush inmediato
+          for (const node of mutation.removedNodes) {
+            this.captureRemovedNode(node);
+          }
+          // Nodos añadidos → extraer captions
           for (const node of mutation.addedNodes) {
             this.extractCaptionsFromNode(node);
           }
@@ -1179,42 +1260,123 @@
       }
     },
 
+    // Flush inmediato cuando Zoom elimina un nodo de caption
+    captureRemovedNode(node) {
+      const tracked = this.liveNodes.get(node);
+      if (tracked?.text) {
+        const nodeId = this.nodeIds.get(node);
+        if (nodeId) {
+          const entry = this.currentBuffer.get(nodeId);
+          if (entry) clearTimeout(entry.timeoutId);
+          this.flushBuffer(nodeId);
+        }
+      }
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_ALL);
+        let child;
+        while ((child = walker.nextNode())) {
+          const childTracked = this.liveNodes.get(child);
+          if (childTracked?.text) {
+            const childId = this.nodeIds.get(child);
+            if (childId) {
+              const entry = this.currentBuffer.get(childId);
+              if (entry) clearTimeout(entry.timeoutId);
+              this.flushBuffer(childId);
+            }
+          }
+        }
+      }
+    },
+
+    // Parsear un caption item de Zoom separando iniciales del speaker del texto real.
+    // Zoom Web Client mete las iniciales del speaker dentro del mismo nodo de caption:
+    //   innerText → "SA\nMuy bien."  (SA = initials, Muy bien. = speech)
+    parseZoomCaption(rawText) {
+      if (!rawText) return { speaker: 'Unknown', text: '' };
+
+      // Separar por salto de línea (las iniciales están en un bloque separado)
+      const lines = rawText.split('\n').map(l => l.trim()).filter(Boolean);
+
+      if (lines.length >= 2) {
+        const first = lines[0];
+        const rest  = lines.slice(1).join(' ').trim();
+        // Las iniciales son ≤4 caracteres y no parecen una oración
+        if (first.length <= 4 && rest.length > 0 && !/[.,!?]/.test(first)) {
+          return { speaker: first, text: rest };
+        }
+      }
+
+      // Sin iniciales detectables
+      return { speaker: 'Unknown', text: rawText };
+    },
+
     // Extraer captions de un nodo
     extractCaptionsFromNode(node) {
       if (node.nodeType === Node.TEXT_NODE) {
         const text = node.textContent?.trim();
-        if (text && text.length > 0) {
-          this.handleCaptionUpdate(text, this.extractSpeakerFromNode(node));
+        if (text && text.length > 1) {
+          const nodeId = this.getNodeId(node);
+          const { speaker } = this.parseZoomCaption(text);
+          this.liveNodes.set(node, { text, speaker });
+          this.handleCaptionUpdate(text, speaker, nodeId);
         }
         return;
       }
 
       if (node.nodeType !== Node.ELEMENT_NODE) return;
 
-      // Verificar si el nodo tiene innerText significativo
-      const text = node.innerText?.trim();
-      if (text && text.length > 1) {
-        this.handleCaptionUpdate(text, this.extractSpeakerFromNode(node));
+      // Item de caption conocido — usar innerText para respetar saltos de línea entre bloques
+      const cls = (typeof node.className === 'string') ? node.className : '';
+      if (cls.includes('subtitle__item') || cls.includes('live-transcription-subtitle__item')) {
+        const rawText = node.innerText?.trim();
+        if (rawText && rawText.length > 1) {
+          const { speaker, text } = this.parseZoomCaption(rawText);
+          if (text) {
+            const nodeId = this.getNodeId(node);
+            this.liveNodes.set(node, { text, speaker });
+            this.handleCaptionUpdate(text, speaker, nodeId);
+          }
+        }
+        return;
+      }
+
+      // Buscar items de caption dentro del nodo añadido
+      const items = node.querySelectorAll?.('[class*="subtitle__item"]');
+      if (items && items.length > 0) {
+        for (const item of items) {
+          const rawText = item.innerText?.trim();
+          if (rawText && rawText.length > 1) {
+            const { speaker, text } = this.parseZoomCaption(rawText);
+            if (text) {
+              const nodeId = this.getNodeId(item);
+              this.liveNodes.set(item, { text, speaker });
+              this.handleCaptionUpdate(text, speaker, nodeId);
+            }
+          }
+        }
+        return;
+      }
+
+      // Fallback: cualquier nodo con texto significativo (sin iniciales sueltas)
+      const rawText = node.innerText?.trim() || node.textContent?.trim();
+      if (rawText && rawText.length > 1 && rawText.length < 600) {
+        const { speaker, text } = this.parseZoomCaption(rawText);
+        if (text) {
+          const nodeId = this.getNodeId(node);
+          this.liveNodes.set(node, { text, speaker });
+          this.handleCaptionUpdate(text, speaker, nodeId);
+        }
       }
     },
 
     // Extraer speaker del contenedor de captions
     extractSpeakerFromContainer(container) {
-      // Zoom puede mostrar múltiples speakers, buscar el activo
-      const speakerElem = container.querySelector(this.SELECTORS.speakerName);
-      if (speakerElem) {
-        return speakerElem.textContent?.trim() || 'Unknown';
+      // Zoom Web Client: buscar el primer item y extraer las iniciales
+      const item = container.querySelector('[class*="subtitle__item"]');
+      if (item) {
+        const { speaker } = this.parseZoomCaption(item.innerText?.trim() || '');
+        if (speaker !== 'Unknown') return speaker;
       }
-
-      // Intentar con avatar
-      const avatarElem = container.querySelector(this.SELECTORS.speakerAvatar);
-      if (avatarElem) {
-        const key = avatarElem.tagName === 'IMG' ? avatarElem.src : avatarElem.textContent?.trim();
-        if (key && this.participantMap.has(key)) {
-          return this.participantMap.get(key);
-        }
-      }
-
       return 'Unknown';
     },
 
@@ -1222,28 +1384,16 @@
     extractSpeakerFromNode(node) {
       if (!node) return 'Unknown';
 
-      let current = node.parentElement;
-      let maxDepth = 10;
+      // Intentar parsear desde el item padre más cercano
+      let current = (node.nodeType === Node.TEXT_NODE) ? node.parentElement : node;
+      let maxDepth = 8;
 
       while (current && maxDepth > 0) {
-        // Buscar nombre de speaker
-        const speakerElem = current.querySelector?.(this.SELECTORS.speakerName);
-        if (speakerElem) {
-          const name = speakerElem.textContent?.trim();
-          if (name && name.length < 100) {
-            return name;
-          }
+        const cls = (typeof current.className === 'string') ? current.className : '';
+        if (cls.includes('subtitle__item')) {
+          const { speaker } = this.parseZoomCaption(current.innerText?.trim() || '');
+          if (speaker !== 'Unknown') return speaker;
         }
-
-        // Buscar avatar para mapeo
-        const avatarElem = current.querySelector?.(this.SELECTORS.speakerAvatar);
-        if (avatarElem) {
-          const key = avatarElem.tagName === 'IMG' ? avatarElem.src : avatarElem.textContent?.trim();
-          if (key && this.participantMap.has(key)) {
-            return this.participantMap.get(key);
-          }
-        }
-
         current = current.parentElement;
         maxDepth--;
       }
@@ -1251,29 +1401,32 @@
       return 'Unknown';
     },
 
-    // Manejar actualización de caption (con debounce y deduplicación)
-    handleCaptionUpdate(text, speaker) {
+    // Manejar actualización de caption
+    // nodeId es el ID estable del nodo DOM — permite acumular texto del mismo elemento
+    handleCaptionUpdate(text, speaker, nodeId) {
       if (!text || text.length < 1) return;
 
       const now = Date.now();
-      const bufferKey = speaker || 'default';
+      // Usar nodeId estable como clave si está disponible, si no caer al speaker
+      const bufferKey = nodeId || speaker || 'default';
       const existing = this.currentBuffer.get(bufferKey);
 
       if (existing?.timeoutId) {
         clearTimeout(existing.timeoutId);
       }
 
-      // Verificar si es actualización del mismo caption
+      // Actualización del mismo caption (texto crece)
       if (existing && this.isTextUpdate(existing.text, text)) {
         this.currentBuffer.set(bufferKey, {
           text: text,
           timestamp: existing.timestamp,
-          speaker: speaker,
+          speaker: (speaker && speaker !== 'Unknown') ? speaker : existing.speaker,
           timeoutId: setTimeout(() => this.flushBuffer(bufferKey), 1500)
         });
       } else if (!existing || !this.isDuplicate(existing.text, text)) {
         // Texto nuevo
         if (existing) {
+          clearTimeout(existing.timeoutId);
           this.flushBuffer(bufferKey);
         }
 
@@ -1362,7 +1515,8 @@
         await chrome.storage.local.set({
           [storageKey]: this.transcript,
           currentMeetingId: meetingId,
-          lastUpdated: Date.now()
+          lastUpdated: Date.now(),
+          liveStats: { wordCount: this.wordCount, lastSpeaker: this.lastSpeaker, lastUpdated: Date.now() }
         });
       } catch (error) {
         if (error.message?.includes('Extension context invalidated')) {
@@ -1380,9 +1534,18 @@
         const storageKey = `transcript_${meetingId}`;
 
         const result = await chrome.storage.local.get([storageKey]);
-        if (result[storageKey] && Array.isArray(result[storageKey])) {
-          this.transcript = result[storageKey];
-          console.log(`[Zoom Capture] Loaded ${this.transcript.length} existing entries`);
+        const saved = result[storageKey];
+        if (saved && Array.isArray(saved) && saved.length > 0) {
+          const isToday = new Date(saved[0].timestamp).toDateString() === new Date().toDateString();
+          if (isToday) {
+            this.transcript = saved;
+            this.wordCount = this.transcript.reduce((sum, e) => sum + e.text.trim().split(/\s+/).filter(w => w).length, 0);
+            this.lastSpeaker = this.transcript[this.transcript.length - 1]?.speaker || null;
+            console.log(`[Zoom Capture] Loaded ${this.transcript.length} existing entries (${this.wordCount} words)`);
+          } else {
+            console.log('[Zoom Capture] Stale transcript discarded (different day)');
+            chrome.storage.local.remove(storageKey).catch(() => {});
+          }
         }
       } catch (error) {
         console.error('[Zoom Capture] Error loading transcript:', error);
@@ -1486,9 +1649,16 @@
     lastCaptionText: '',
     lastCaptionTime: 0,
     currentBuffer: new Map(),
-    captionIdMap: new Map(), // Para tracking de captions ya procesados
     wordCount: 0,
     lastSpeaker: null,
+
+    // Mapeo estable nodo → ID string (igual que Meet usa liveNodes)
+    // Esto es la clave del fix: cada nodo DOM tiene SIEMPRE el mismo ID de buffer,
+    // así las 10 mutaciones de "Hola cómo están..." acumulan texto en la misma entrada.
+    liveNodes: new WeakMap(),      // node → {text, speaker}
+    nodeIds: new WeakMap(),        // node → ID estable
+    nodeIdSeq: 0,
+    _captionContainerFound: false, // true cuando encontramos el contenedor real
 
     // Selectores DOM para captions de Teams Web (basados en data-tid attributes)
     SELECTORS: {
@@ -1496,17 +1666,27 @@
       captionWrapper: '[data-tid="closed-caption-v2-window-wrapper"]',
       captionRenderer: '[data-tid="closed-captions-renderer"]',
       captionContainerAlt: '[data-tid*="closed-caption"]',
+      // Fallbacks adicionales por aria
+      captionContainerAria: '[aria-live][aria-label*="caption" i], [role="log"][aria-label*="caption" i]',
       // Elementos individuales de caption
       captionEntry: '.fui-ChatMessageCompact, [data-tid*="caption-entry"]',
       // Speaker name
       speakerName: '[data-tid="author"]',
-      // Caption text
-      captionText: '[data-tid="closed-caption-text"]',
+      // Caption text — variantes conocidas
+      captionText: '[data-tid="closed-caption-text"], [data-tid*="caption-text"]',
       // Panel de asistentes
       attendeesTree: '[role="tree"][aria-label*="Attendees"], [role="tree"][aria-label*="Participants"]',
       participantItem: '[data-tid^="participantsInCall-"]',
       // Botón de personas (para abrir panel)
       peopleButton: 'button[data-tid="calling-toolbar-people-button"]'
+    },
+
+    // Asignar ID estable a un nodo DOM (persiste mientras el nodo esté en memoria)
+    getNodeId(node) {
+      if (!this.nodeIds.has(node)) {
+        this.nodeIds.set(node, `ts_${++this.nodeIdSeq}`);
+      }
+      return this.nodeIds.get(node);
     },
 
     // Iniciar captura
@@ -1516,53 +1696,70 @@
       this.transcript = [];
       this.lastCaptionText = '';
       this.currentBuffer.clear();
-      this.captionIdMap.clear();
+      this.nodeIdSeq = 0;
+      this._captionContainerFound = false;
 
       // Cargar transcripción existente
       this.loadExistingTranscript();
 
+      // Log de diagnóstico: muestra los data-tid disponibles en el DOM
+      const allDataTids = [...document.querySelectorAll('[data-tid]')]
+        .map(e => e.getAttribute('data-tid'))
+        .filter(Boolean)
+        .slice(0, 30);
+      console.log('[Teams Capture] data-tid elements in DOM:', allDataTids);
+
       // Intentar encontrar captions
       this.findAndObserveCaptions();
 
-      // Polling como fallback
+      // Polling:
+      //   - Si no encontramos el contenedor aún → reintentar findAndObserveCaptions cada vez
+      //   - Siempre hacer polling de seguridad sobre el DOM visible
       this.pollInterval = setInterval(() => {
-        if (!this.observer) {
+        if (!this._captionContainerFound) {
           this.findAndObserveCaptions();
         }
-      }, 2000);
+        this.pollCurrentCaptions();
+      }, 1000);
     },
 
-    // Buscar contenedor de captions
-    findAndObserveCaptions() {
-      // Buscar por selectores principales
-      let captionContainer = document.querySelector(this.SELECTORS.captionWrapper);
+    // Leer captions actualmente visibles en el DOM (fallback anti-missed-mutations)
+    pollCurrentCaptions() {
+      // Buscar con todos los selectores conocidos + heurística posicional
+      const selectors = [
+        this.SELECTORS.captionText,
+        '[data-tid*="caption-text"]',
+        '[class*="closed-caption"]',
+        '[class*="caption-text"]',
+      ].join(', ');
 
-      if (!captionContainer) {
-        captionContainer = document.querySelector(this.SELECTORS.captionRenderer);
-      }
+      let captionElems;
+      try { captionElems = document.querySelectorAll(selectors); } catch { return; }
 
-      if (!captionContainer) {
-        captionContainer = document.querySelector(this.SELECTORS.captionContainerAlt);
-      }
-
-      // Buscar por data-tid genérico
-      if (!captionContainer) {
-        const allCaptionElements = document.querySelectorAll('[data-tid*="caption"]');
-        for (const elem of allCaptionElements) {
-          if (this.looksLikeCaptionContainer(elem)) {
-            captionContainer = elem;
-            break;
-          }
+      for (const elem of captionElems) {
+        const text = elem.textContent?.trim();
+        if (!text || text.length < 2 || text.length > 600) continue;
+        const nodeId = this.getNodeId(elem);
+        const speaker = this.extractSpeakerFromCaptionElement(elem);
+        const tracked = this.liveNodes.get(elem);
+        if (!tracked || tracked.text !== text) {
+          this.liveNodes.set(elem, { text, speaker });
+          this.handleCaptionUpdate(text, speaker, nodeId);
         }
       }
+    },
+
+    // Buscar contenedor de captions usando todas las estrategias disponibles
+    findAndObserveCaptions() {
+      // Reutilizar la búsqueda comprehensiva sobre el documento completo
+      const captionContainer = this.findCaptionContainerIn(document.body);
 
       if (captionContainer) {
-        console.log('[Teams Capture] Caption container found, setting up observer');
         this.setupObserver(captionContainer);
         return true;
       }
 
-      // Observer de documento como fallback
+      // Última fallback: observar el documento completo esperando que aparezca
       this.setupDocumentObserver();
       return false;
     },
@@ -1571,20 +1768,26 @@
     looksLikeCaptionContainer(element) {
       if (!element) return false;
 
-      // Debe tener texto o elementos hijos con texto
-      const hasText = element.textContent?.trim().length > 0;
-      // Verificar si tiene elementos de caption dentro
-      const hasCaptionElements = element.querySelector(this.SELECTORS.captionText) !== null ||
-                                 element.querySelector(this.SELECTORS.speakerName) !== null;
+      const dataTid = element.getAttribute?.('data-tid') || '';
+      if (dataTid.includes('caption')) return true;
 
-      return hasText || hasCaptionElements;
+      // aria-live es señal fuerte
+      if (element.hasAttribute?.('aria-live')) return true;
+
+      // Verificar si tiene elementos de caption dentro
+      if (element.querySelector?.(this.SELECTORS.captionText)) return true;
+      if (element.querySelector?.(this.SELECTORS.speakerName)) return true;
+
+      return false;
     },
 
-    // Configurar MutationObserver
+    // Configurar MutationObserver sobre el contenedor de captions encontrado
     setupObserver(container) {
       if (this.observer) {
         this.observer.disconnect();
       }
+
+      this._captionContainerFound = true;
 
       this.observer = new MutationObserver((mutations) => {
         this.processMutations(mutations);
@@ -1594,64 +1797,108 @@
         childList: true,
         subtree: true,
         characterData: true,
-        characterDataOldValue: true,
-        attributes: true,
-        attributeFilter: ['data-caption-id']
+        characterDataOldValue: true
       });
 
-      if (this.pollInterval) {
-        clearInterval(this.pollInterval);
-        this.pollInterval = null;
-      }
+      // NO cancelamos el pollInterval — sigue corriendo como safety net
+      console.log('[Teams Capture] MutationObserver active on caption container');
 
-      console.log('[Teams Capture] MutationObserver active');
-
-      // Procesar captions existentes
+      // Procesar captions que ya están en el contenedor
       this.processExistingCaptions(container);
     },
 
-    // Observer de documento como fallback
+    // Observer de documento como fallback — SOLO busca el contenedor, no procesa texto
     setupDocumentObserver() {
       if (this.observer) return;
 
       this.observer = new MutationObserver((mutations) => {
         for (const mutation of mutations) {
-          if (mutation.addedNodes.length > 0) {
-            for (const node of mutation.addedNodes) {
-              if (node.nodeType === Node.ELEMENT_NODE) {
-                // Verificar data-tid attributes
-                const dataTid = node.getAttribute?.('data-tid') || '';
-                if (dataTid.includes('caption') || dataTid.includes('closed-caption')) {
-                  this.observer.disconnect();
-                  this.observer = null;
-                  this.setupObserver(node);
-                  return;
-                }
-
-                // Buscar dentro del nodo
-                const captionContainer = node.querySelector?.(this.SELECTORS.captionWrapper) ||
-                                        node.querySelector?.(this.SELECTORS.captionRenderer);
-                if (captionContainer) {
-                  this.observer.disconnect();
-                  this.observer = null;
-                  this.setupObserver(captionContainer);
-                  return;
-                }
-              }
+          if (mutation.type !== 'childList') continue;
+          for (const node of mutation.addedNodes) {
+            if (node.nodeType !== Node.ELEMENT_NODE) continue;
+            const container = this.findCaptionContainerIn(node);
+            if (container) {
+              console.log('[Teams Capture] Caption container found via document observer');
+              this.observer.disconnect();
+              this.observer = null;
+              this.setupObserver(container);
+              return;
             }
           }
         }
-
-        this.processMutations(mutations);
       });
 
       this.observer.observe(document.body, {
         childList: true,
-        subtree: true,
-        characterData: true
+        subtree: true
+        // Sin characterData — demasiado ruido a nivel documento
       });
 
       console.log('[Teams Capture] Document observer active (waiting for captions)');
+    },
+
+    // Buscar el contenedor de captions dentro de un nodo (o en el nodo mismo)
+    // Usa múltiples estrategias para cubrir distintas versiones de Teams Web
+    findCaptionContainerIn(root) {
+      if (!root || root.nodeType !== Node.ELEMENT_NODE) return null;
+
+      // Estrategia 1: el nodo mismo tiene data-tid relacionado con captions
+      const dataTid = (root.getAttribute?.('data-tid') || '').toLowerCase();
+      if (dataTid.includes('caption')) {
+        console.log('[Teams Capture] Found via root data-tid:', dataTid);
+        return root;
+      }
+
+      // Estrategia 2: buscar selectores conocidos dentro del nodo
+      const knownSelectors = [
+        '[data-tid="closed-caption-v2-window-wrapper"]',
+        '[data-tid="closed-captions-renderer"]',
+        '[data-tid*="closed-caption"]',
+        '[data-tid*="caption"]',
+      ];
+      for (const sel of knownSelectors) {
+        try {
+          const found = root.querySelector?.(sel);
+          if (found) {
+            console.log('[Teams Capture] Found via selector:', sel);
+            return found;
+          }
+        } catch {}
+      }
+
+      // Estrategia 3: aria-live en la mitad inferior
+      try {
+        const liveRegions = root.querySelectorAll?.('[aria-live]') || [];
+        for (const region of liveRegions) {
+          const rect = region.getBoundingClientRect();
+          if (rect.top > window.innerHeight * 0.35 && rect.width > 80) {
+            console.log('[Teams Capture] Found via aria-live region');
+            return region;
+          }
+        }
+      } catch {}
+
+      // Estrategia 4: aria-label con "caption" o "subtitle"
+      try {
+        const byLabel = root.querySelector?.(
+          '[aria-label*="caption" i], [aria-label*="subtitle" i], [aria-label*="subtítulo" i]'
+        );
+        if (byLabel) {
+          console.log('[Teams Capture] Found via aria-label');
+          return byLabel;
+        }
+      } catch {}
+
+      // Estrategia 5: role="log" (región de texto en vivo — estándar ARIA para transcripciones)
+      try {
+        const logRegion = root.querySelector?.('[role="log"]');
+        if (logRegion) {
+          console.log('[Teams Capture] Found via role=log');
+          return logRegion;
+        }
+      } catch {}
+
+      return null;
     },
 
     // Procesar captions existentes en el contenedor
@@ -1662,47 +1909,74 @@
         const text = textElem.textContent?.trim();
         if (text) {
           const speaker = this.extractSpeakerFromCaptionElement(textElem);
-          this.handleCaptionUpdate(text, speaker, this.generateCaptionId(textElem));
+          const nodeId = this.getNodeId(textElem);
+          this.liveNodes.set(textElem, { text, speaker });
+          this.handleCaptionUpdate(text, speaker, nodeId);
         }
       }
     },
 
-    // Generar ID único para caption
-    generateCaptionId(element) {
-      // Intentar obtener ID existente
-      let captionId = element.getAttribute?.('data-caption-id');
-      if (captionId) return captionId;
-
-      // Buscar en padres
-      let parent = element.parentElement;
-      while (parent) {
-        captionId = parent.getAttribute?.('data-caption-id');
-        if (captionId) return captionId;
-        parent = parent.parentElement;
-      }
-
-      // Generar nuevo ID
-      const randomStr = Math.random().toString(36).substring(2, 8);
-      return `caption_${Date.now()}_${randomStr}`;
-    },
-
     // Procesar mutaciones del DOM
+    // FIX PRINCIPAL: usamos IDs estables por nodo DOM en vez de IDs aleatorios.
+    // Antes cada mutación generaba un ID nuevo → cada palabra era una entrada separada.
+    // Ahora el mismo nodo DOM siempre acumula texto en la misma entrada del buffer.
     processMutations(mutations) {
       for (const mutation of mutations) {
-        // Cambios de texto
+        // Cambios de texto en vivo (el nodo sigue en el DOM, su texto cambió)
         if (mutation.type === 'characterData') {
           const text = mutation.target.textContent?.trim();
           if (text && text !== mutation.oldValue?.trim()) {
             const speaker = this.extractSpeakerFromNode(mutation.target);
-            const captionId = this.generateCaptionId(mutation.target);
-            this.handleCaptionUpdate(text, speaker, captionId);
+            const nodeId = this.getNodeId(mutation.target);
+            // Guardar el texto más reciente de este nodo
+            this.liveNodes.set(mutation.target, { text, speaker });
+            this.handleCaptionUpdate(text, speaker, nodeId);
           }
         }
 
-        // Nodos añadidos
-        if (mutation.type === 'childList' && mutation.addedNodes.length > 0) {
+        if (mutation.type === 'childList') {
+          // NODOS ELIMINADOS: el caption fue finalizado por Teams → flush inmediato
+          for (const node of mutation.removedNodes) {
+            this.captureRemovedNode(node);
+          }
+
+          // Nodos añadidos: nuevo caption
           for (const node of mutation.addedNodes) {
             this.extractCaptionsFromNode(node);
+          }
+        }
+      }
+    },
+
+    // Cuando Teams elimina un nodo de caption, hacer flush inmediato del buffer
+    captureRemovedNode(node) {
+      const tracked = this.liveNodes.get(node);
+      if (tracked?.text) {
+        const nodeId = this.nodeIds.get(node);
+        if (nodeId) {
+          const bufferEntry = this.currentBuffer.get(nodeId);
+          if (bufferEntry) {
+            clearTimeout(bufferEntry.timeoutId);
+          }
+          this.flushBuffer(nodeId);
+        }
+      }
+
+      // Revisar también los hijos del nodo eliminado
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_ALL);
+        let child;
+        while ((child = walker.nextNode())) {
+          const childTracked = this.liveNodes.get(child);
+          if (childTracked?.text) {
+            const childNodeId = this.nodeIds.get(child);
+            if (childNodeId) {
+              const bufferEntry = this.currentBuffer.get(childNodeId);
+              if (bufferEntry) {
+                clearTimeout(bufferEntry.timeoutId);
+              }
+              this.flushBuffer(childNodeId);
+            }
           }
         }
       }
@@ -1714,15 +1988,29 @@
         const text = node.textContent?.trim();
         if (text && text.length > 0) {
           const speaker = this.extractSpeakerFromNode(node);
-          const captionId = this.generateCaptionId(node);
-          this.handleCaptionUpdate(text, speaker, captionId);
+          const nodeId = this.getNodeId(node);
+          this.liveNodes.set(node, { text, speaker });
+          this.handleCaptionUpdate(text, speaker, nodeId);
         }
         return;
       }
 
       if (node.nodeType !== Node.ELEMENT_NODE) return;
 
-      // Buscar elementos de caption text
+      // Verificar si el nodo mismo tiene caption text (data-tid exacto)
+      const dataTid = node.getAttribute?.('data-tid') || '';
+      if (dataTid === 'closed-caption-text' || dataTid.includes('caption-text')) {
+        const text = node.textContent?.trim();
+        if (text) {
+          const speaker = this.extractSpeakerFromCaptionElement(node);
+          const nodeId = this.getNodeId(node);
+          this.liveNodes.set(node, { text, speaker });
+          this.handleCaptionUpdate(text, speaker, nodeId);
+          return; // ya procesamos este nodo, no buscar dentro
+        }
+      }
+
+      // Buscar elementos de caption text dentro del nodo añadido
       const captionTextElements = node.querySelectorAll
         ? node.querySelectorAll(this.SELECTORS.captionText)
         : [];
@@ -1731,18 +2019,9 @@
         const text = textElem.textContent?.trim();
         if (text) {
           const speaker = this.extractSpeakerFromCaptionElement(textElem);
-          const captionId = this.generateCaptionId(textElem);
-          this.handleCaptionUpdate(text, speaker, captionId);
-        }
-      }
-
-      // Verificar si el nodo mismo tiene caption text
-      if (node.getAttribute?.('data-tid') === 'closed-caption-text') {
-        const text = node.textContent?.trim();
-        if (text) {
-          const speaker = this.extractSpeakerFromCaptionElement(node);
-          const captionId = this.generateCaptionId(node);
-          this.handleCaptionUpdate(text, speaker, captionId);
+          const nodeId = this.getNodeId(textElem);
+          this.liveNodes.set(textElem, { text, speaker });
+          this.handleCaptionUpdate(text, speaker, nodeId);
         }
       }
     },
@@ -1777,27 +2056,13 @@
     },
 
     // Manejar actualización de caption
+    // captionId es ahora SIEMPRE un ID estable (ts_N) del nodo DOM.
+    // Esto permite acumular todas las mutaciones de un mismo nodo en una sola
+    // entrada del buffer, en lugar de crear un fragmento por cada mutación.
     handleCaptionUpdate(text, speaker, captionId) {
       if (!text || text.length < 1) return;
 
       const now = Date.now();
-
-      // Verificar si ya procesamos este caption (por ID)
-      if (captionId && this.captionIdMap.has(captionId)) {
-        const existingEntry = this.captionIdMap.get(captionId);
-        // Actualizar si el texto cambió
-        if (existingEntry.text !== text) {
-          existingEntry.text = text;
-          // Actualizar en transcript también
-          const idx = this.transcript.findIndex(e => e.key === captionId);
-          if (idx !== -1) {
-            this.transcript[idx].text = text;
-            this.saveTranscript();
-          }
-        }
-        return;
-      }
-
       const bufferKey = captionId || speaker || 'default';
       const existing = this.currentBuffer.get(bufferKey);
 
@@ -1806,15 +2071,19 @@
       }
 
       if (existing && this.isTextUpdate(existing.text, text)) {
+        // Actualización del mismo caption en vivo: extender texto, mantener timestamp original
         this.currentBuffer.set(bufferKey, {
           text: text,
           timestamp: existing.timestamp,
-          speaker: speaker,
+          // Preferir el speaker real sobre Unknown
+          speaker: (speaker && speaker !== 'Unknown') ? speaker : existing.speaker,
           captionId: captionId,
-          timeoutId: setTimeout(() => this.flushBuffer(bufferKey), 1200)
+          timeoutId: setTimeout(() => this.flushBuffer(bufferKey), 1500)
         });
       } else if (!existing || !this.isDuplicate(existing.text, text)) {
+        // Texto nuevo: si había uno previo sin flush, hacerlo ahora
         if (existing) {
+          clearTimeout(existing.timeoutId);
           this.flushBuffer(bufferKey);
         }
 
@@ -1823,7 +2092,7 @@
           timestamp: now,
           speaker: speaker,
           captionId: captionId,
-          timeoutId: setTimeout(() => this.flushBuffer(bufferKey), 1200)
+          timeoutId: setTimeout(() => this.flushBuffer(bufferKey), 1500)
         });
       }
     },
@@ -1886,11 +2155,6 @@
       this.transcript.push(transcriptEntry);
       this.currentBuffer.delete(bufferKey);
 
-      // Guardar en mapa de IDs procesados
-      if (entry.captionId) {
-        this.captionIdMap.set(entry.captionId, { text: entry.text, speaker: entry.speaker });
-      }
-
       this.wordCount += entry.text.trim().split(/\s+/).filter(w => w).length;
       this.lastSpeaker = entry.speaker || 'Unknown';
 
@@ -1910,7 +2174,8 @@
         await chrome.storage.local.set({
           [storageKey]: this.transcript,
           currentMeetingId: meetingId,
-          lastUpdated: Date.now()
+          lastUpdated: Date.now(),
+          liveStats: { wordCount: this.wordCount, lastSpeaker: this.lastSpeaker, lastUpdated: Date.now() }
         });
       } catch (error) {
         if (error.message?.includes('Extension context invalidated')) {
@@ -1928,15 +2193,18 @@
         const storageKey = `transcript_${meetingId}`;
 
         const result = await chrome.storage.local.get([storageKey]);
-        if (result[storageKey] && Array.isArray(result[storageKey])) {
-          this.transcript = result[storageKey];
-          // Reconstruir mapa de IDs
-          for (const entry of this.transcript) {
-            if (entry.key) {
-              this.captionIdMap.set(entry.key, { text: entry.text, speaker: entry.speaker });
-            }
+        const saved = result[storageKey];
+        if (saved && Array.isArray(saved) && saved.length > 0) {
+          const isToday = new Date(saved[0].timestamp).toDateString() === new Date().toDateString();
+          if (isToday) {
+            this.transcript = saved;
+            this.wordCount = this.transcript.reduce((sum, e) => sum + e.text.trim().split(/\s+/).filter(w => w).length, 0);
+            this.lastSpeaker = this.transcript[this.transcript.length - 1]?.speaker || null;
+            console.log(`[Teams Capture] Loaded ${this.transcript.length} existing entries (${this.wordCount} words)`);
+          } else {
+            console.log('[Teams Capture] Stale transcript discarded (different day)');
+            chrome.storage.local.remove(storageKey).catch(() => {});
           }
-          console.log(`[Teams Capture] Loaded ${this.transcript.length} existing entries`);
         }
       } catch (error) {
         console.error('[Teams Capture] Error loading transcript:', error);

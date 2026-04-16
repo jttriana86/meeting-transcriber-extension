@@ -175,16 +175,25 @@ function startStatsPolling() {
   liveWords.textContent = '📝 0 palabras';
   liveSpeaker.textContent = '';
 
+  // Leer inmediatamente sin esperar el primer tick del interval
+  chrome.storage.local.get(['liveStats']).then(result => {
+    const stats = result.liveStats;
+    if (stats) {
+      liveWords.textContent = `📝 ${stats.wordCount.toLocaleString()} palabras`;
+      liveSpeaker.textContent = stats.lastSpeaker ? `🎤 ${stats.lastSpeaker}` : '';
+    }
+  }).catch(() => {});
+
   statsPollingInterval = setInterval(async () => {
-    if (!currentTabId) return;
     try {
-      const stats = await chrome.tabs.sendMessage(currentTabId, { action: 'GET_STATS' });
+      const result = await chrome.storage.local.get(['liveStats']);
+      const stats = result.liveStats;
       if (stats) {
         liveWords.textContent = `📝 ${stats.wordCount.toLocaleString()} palabras`;
         liveSpeaker.textContent = stats.lastSpeaker ? `🎤 ${stats.lastSpeaker}` : '';
       }
     } catch {
-      // content script no disponible aún
+      // storage no disponible
     }
   }, 2000);
 }
